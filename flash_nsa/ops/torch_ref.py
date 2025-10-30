@@ -5,27 +5,25 @@ def cdiv(x: int, y: int):
     return (x + y - 1) // y
 
 def torch_construct_block(x, kernel_size, stride):
-    '''
-    Args:
-        x (Tensor): [bs, n, h, d]
-        weight (Parameters): [kernel_size], 貌似可以加个维度h，作用看下面代码
-        pe_embeding (Parameters): [kernel_size, d], 貌似也可以加个维度h，类似bert中的pe
-        stride (int): 论文中的d
-    Return:
-        compress_x (Tensor): [bs, num_blocks, h, d]
-    '''
     T, H, D = x.shape
-    num_blocks = max((T - kernel_size) // stride + 1, 0)
 
-    # [bs, h, num_blocks, kernel_size, D]
-    block_x = torch.cat(
-        [
-        torch.roll(x, shifts=-1 * idx * stride, dims=0)[:num_blocks*stride].reshape(num_blocks, stride, H, D)
-        for idx in range(kernel_size//stride)
-        ], 
-        axis=1
-        )
-    return block_x.transpose(1, 2)
+    num_blocks = (T + stride - 1) // stride
+
+    if num_blocks == 0:
+        return torch.zeros(0, H, stride, D, dtype=x.dtype, device=x.device)
+
+    block_x = torch.zeros(num_blocks, stride, H, D, dtype=x.dtype, device=x.device)
+
+    for block_idx in range(num_blocks):
+        start_idx = block_idx * stride
+        end_idx = min(start_idx + stride, T)  
+
+        actual_size = end_idx - start_idx
+        block_x[block_idx, :actual_size] = x[start_idx:end_idx]
+
+    block_x = block_x.transpose(1, 2)
+
+    return block_x
 
 def torch_swiglu(x):
     gate, up = x.chunk(2, -1)
@@ -37,29 +35,16 @@ def torch_sigmoid_mul(x):
 
 
 def torch_cmp_attn(q, k:torch.Tensor, v, kernel_size, stride):
-    # q = q.unsqueeze(0).transpose(1, 2)
-    # k = k.unsqueeze(0).transpose(1, 2)
-    # v = v.unsqueeze(0).transpose(1, 2)
-    # def score_mod(score, batch, head, q_idx, block_idx):
-    #     k_idx = block_idx * stride + kernel_size - 1
-    #     score = score + (q_idx < k_idx) * float('-inf')
-    #     return score
-    # out = flex_attention(q, k, v, enable_gqa=True, score_mod=score_mod)
-    # return out.transpose(1,2).squeeze(0)
-
     k = k.repeat_interleave(q.size(1)//k.size(1), 1)
     v = v.repeat_interleave(q.size(1)//v.size(1), 1)
     sm_scale = q.size(-1) ** -0.5
     score = torch.einsum("nhd, mhd->hnm", q, k)
-    q_idx = torch.arange(0, q.size(0), device=q.device, dtype=torch.int32)
-    block_idx = torch.arange(0, k.size(0), device=q.device, dtype=torch.int32)
-    k_idx = block_idx * stride + kernel_size - 1
-    mask = q_idx[:, None] >= k_idx[None, :]
-    score = torch.where(mask[None,:,:], score * sm_scale, float('-inf'))
+    score = score * sm_scale
+    lse = torch.logsumexp(score.float(), dim=-1) 
     p = score.softmax(-1, dtype=torch.float32).to(q.dtype)
-    p[:, :kernel_size-1] = 0
     out = torch.einsum("hnm,mhd->nhd", p, v)
-    return out
+    return out, lse
+
 
 def torch_topk(q, k:torch.Tensor, kernel_size, stride, block_size, topn, num_init, num_local, ignore_idx=99999999):
     n, qh, d = q.shape

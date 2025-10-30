@@ -5,6 +5,7 @@ import math
 import torch
 import triton
 import triton.language as tl
+
 from . import ampere_ops
 from ..utils import NSAHelper, use_tma
 
@@ -66,7 +67,6 @@ def _cmp_fwd_kernel(
         x_bos, x_eos = tl.load(X_CU_SEQLENS + off_b), tl.load(X_CU_SEQLENS + off_b + 1)
         x_len = x_eos - x_bos
         cp_offset = tl.load(CP_OFFSET + cp_off_b)
-        start_n = cp_start_n + cp_offset
 
     y_bos, y_eos = tl.load(Y_CU_SEQLENS + off_b), tl.load(Y_CU_SEQLENS + off_b + 1)
     y_len = y_eos - y_bos
@@ -96,17 +96,17 @@ def _cmp_fwd_kernel(
     l_i = tl.zeros([BLOCK_N], dtype=tl.float32)
     acc = tl.zeros([BLOCK_N, VD], dtype=tl.float32)
 
-    mid = tl.minimum((start_n - kernel_size) // stride + 1, y_len).to(tl.int32)
-    mid = (mid // BLOCK_M) * BLOCK_M
-    end = tl.minimum((start_n + BLOCK_N - kernel_size) // stride + 1, y_len).to(tl.int32)
-    for start_block_kv_idx in range(0, mid, BLOCK_M):
+
+    end = y_len
+    for start_block_kv_idx in range(0, end, BLOCK_M):
+
         k = desc_k.load([start_block_kv_idx, 0])
         v = desc_v.load([start_block_kv_idx, 0])
+
         attn_score = tl.dot(q, tl.permute(k, 1, 0))
-        if D2>0:
+        if D2 > 0:
             k2 = desc_k2.load([start_block_kv_idx, 0])
             attn_score = tl.dot(q2, tl.permute(k2, 1, 0), attn_score)
-
         attn_score *= sm_scale
 
         m_ij = tl.max(attn_score, axis=1)
@@ -114,41 +114,14 @@ def _cmp_fwd_kernel(
         alpha = tl.exp2(m_i - new_m_i)
 
         exp_attn_score = tl.exp2(attn_score - new_m_i[:, None])
-
         l_i = tl.fma(l_i, alpha, tl.sum(exp_attn_score, axis=-1))
         acc = acc * alpha[:, None]
-
         acc = tl.dot(exp_attn_score.to(v.dtype), v, acc=acc)
         m_i = new_m_i
 
-    for start_block_kv_idx in range(mid, end, BLOCK_M):
-        k = desc_k.load([start_block_kv_idx, 0])
-        v = desc_v.load([start_block_kv_idx, 0])
-        attn_score = tl.dot(q, tl.permute(k, 1, 0))
-        if D2>0:
-            k2 = desc_k2.load([start_block_kv_idx, 0])
-            attn_score = tl.dot(q2, tl.permute(k2, 1, 0), attn_score)
-
-        k_idx = (start_block_kv_idx + tl.arange(0, BLOCK_M)) * stride + kernel_size - 1
-        attn_score = tl.where(q_idx[:, None] >= k_idx[None, :], attn_score * sm_scale, float('-inf'))
-
-        m_ij = tl.max(attn_score, axis=1)
-        new_m_i = tl.maximum(m_i, m_ij)
-        alpha = tl.exp2(m_i - new_m_i)
-
-        exp_attn_score = tl.exp2(attn_score - new_m_i[:, None])
-
-        l_i = tl.fma(l_i, alpha, tl.sum(exp_attn_score, axis=-1))
-        acc = acc * alpha[:, None]
-
-        acc = tl.dot(exp_attn_score.to(v.dtype), v, acc=acc)
-        m_i = new_m_i
 
     acc /= l_i[:, None]
     lse = m_i + tl.log2(l_i)
-    if cp_start_n == 0:
-        acc = tl.where(q_idx[:, None]>=(kernel_size-1), acc, 0)
-        lse = tl.where(q_idx>=(kernel_size-1), lse, 0)
     desc_o.store([cp_start_n, 0], acc.to(desc_o.dtype)) 
     tl.store(LSE + cp_idx * lse_stride_n, lse, mask=cp_idx < cp_len)
 
@@ -253,8 +226,6 @@ def _cmp_dkdv_kernel(
         cp_bos, cp_eos = tl.load(CP_CU_SEQLENS + cp_off_b), tl.load(CP_CU_SEQLENS + cp_off_b + 1)
         cp_len = cp_eos - cp_bos
         cp_offset = tl.load(CP_OFFSET + cp_off_b)
-        if (start_m * stride + kernel_size - 1) >= (cp_offset + cp_len):
-            return
 
     if REPEAT_DKDV:
         off_dkdvh = off_qh
@@ -289,6 +260,7 @@ def _cmp_dkdv_kernel(
 
     k = desc_k.load([start_m, 0])
     v = desc_v.load([start_m, 0])
+
     acc_dk = tl.zeros((BLOCK_M, D1), dtype=tl.float32)
     acc_dv = tl.zeros((BLOCK_M, VD), dtype=tl.float32)
 
@@ -297,10 +269,7 @@ def _cmp_dkdv_kernel(
         acc_dk2 = tl.zeros((BLOCK_M, D2), dtype=tl.float32)
 
     sm_scale_ln2 = sm_scale * 1.44269504
-    k_idx = off_m * stride + kernel_size - 1
-    begin = tl.maximum(start_m * stride + kernel_size - 1 - cp_offset, 0)
-    mid = tl.minimum(begin + tl.cdiv((BLOCK_M-1) * stride, BLOCK_N) * BLOCK_N, cp_len)
-    for cp_start_n in range(begin, cp_len, BLOCK_N):
+    for cp_start_n in range(0, cp_len, BLOCK_N):
         cp_idx = cp_start_n + tl.arange(0, BLOCK_N)
         q_idx = cp_idx + cp_offset
         q = desc_q.load([cp_start_n, 0])
@@ -312,7 +281,6 @@ def _cmp_dkdv_kernel(
         if D2 > 0:
             q2 = desc_q2.load([cp_start_n, 0])
             attn_score = tl.dot(q2, tl.permute(k2, 1, 0), attn_score)
-        attn_score = tl.where(q_idx[:, None] >= k_idx[None, :], attn_score, float('-inf'))
         p = tl.exp2(attn_score * sm_scale_ln2 -lse[:, None])
 
         acc_dv = tl.dot(tl.trans(p, 1, 0).to(do.dtype), do, acc_dv)
@@ -330,39 +298,6 @@ def _cmp_dkdv_kernel(
             if D2 > 0:
                 dq2 = tl.dot(ds.to(k.dtype), k2) * sm_scale
                 desc_dq2.atomic_add([cp_start_n, 0], dq2.to(desc_dq.dtype))
-
-    # for cp_start_n in range(mid, cp_len, BLOCK_N):
-    #     cp_idx = cp_start_n + tl.arange(0, BLOCK_N)
-    #     # q_idx = cp_idx + cp_offset
-    #     q = desc_q.load([cp_start_n, 0])
-    #     do = desc_do.load([cp_start_n, 0])
-    #     lse = tl.load(Lse + cp_idx * lse_stride_n, mask=cp_idx < cp_len, other=0.)
-    #     delta = tl.load(Delta + cp_idx * lse_stride_n, mask=cp_idx < cp_len, other=0.)
-
-    #     attn_score = tl.dot(q, tl.permute(k, 1, 0)) 
-
-    #     if D2 > 0:
-    #         q2 = desc_q2.load([cp_start_n, 0])
-    #         attn_score = tl.dot(q2, tl.permute(k2, 1, 0), attn_score)
-
-    #     # attn_score = tl.where(q_idx[:, None] >= k_idx[None, :], attn_score, float('-inf'))
-    #     p = tl.exp2(attn_score * sm_scale_ln2 -lse[:, None])
-
-    #     acc_dv = tl.dot(tl.trans(p, 1, 0).to(do.dtype), do, acc_dv)
-
-    #     dp = tl.dot(do, tl.permute(v, 1, 0))
-    #     ds = p * (dp - delta[:, None])
-
-    #     acc_dk = tl.dot(tl.trans(ds, 1, 0).to(q.dtype), q, acc_dk)
-    #     if D2 > 0:
-    #         acc_dk2 = tl.dot(tl.trans(ds, 1, 0).to(q.dtype), q2, acc_dk2)
-
-    #     if COMPUTE_DQ:
-    #         dq = tl.dot(ds.to(k.dtype), k) * sm_scale
-    #         desc_dq.atomic_add([cp_start_n, 0], dq.to(desc_dq.dtype))
-    #         if D2 > 0:
-    #             dq2 = tl.dot(ds.to(k.dtype), k2) * sm_scale
-    #             desc_dq2.atomic_add([cp_start_n, 0], dq2.to(desc_dq.dtype))
 
     if not ATOMIC:
         desc_dk.store([start_m, 0], (acc_dk * sm_scale).to(desc_dk.dtype))
@@ -476,11 +411,8 @@ def _cmp_dq_kernel(
         acc_dq2 = tl.zeros((BLOCK_N, D2), dtype=tl.float32)
 
     sm_scale_ln2 = sm_scale * 1.44269504
-    mid = tl.minimum((start_n - kernel_size) // stride + 1, y_len).to(tl.int32)
-    mid = (mid // BLOCK_M) * BLOCK_M
-    end = tl.minimum((start_n + BLOCK_N - kernel_size) // stride + 1, y_len).to(tl.int32)
-    for start_m in range(0, mid, BLOCK_M):
-        # block_idx = start_block_kv_idx + tl.arange(0, BLOCK_M)
+    end = y_len
+    for start_m in range(0, end, BLOCK_M):
         k = desc_k.load([start_m, 0])
         v = desc_v.load([start_m, 0])
         attn_score = tl.dot(q, tl.permute(k, 1, 0)) 
@@ -488,28 +420,7 @@ def _cmp_dq_kernel(
             k2 = desc_k2.load([start_m, 0])
             attn_score = tl.dot(q2, tl.permute(k2, 1, 0), attn_score)
 
-        # k_idx = block_idx * stride + kernel_size - 1
-        # attn_score = tl.where(q_idx[:, None] >= k_idx[None, :], attn_score, float('-inf'))
         p = tl.exp2(attn_score * sm_scale_ln2 - lse[:, None])
-
-        dp = tl.dot(do, tl.permute(v, 1, 0))
-        ds = p * (dp - delta[:, None])
-
-        acc_dq = tl.dot(ds.to(k.dtype), k, acc_dq)
-        if D2 > 0:
-            acc_dq2 = tl.dot(ds.to(k.dtype), k2, acc_dq2)
-
-    for start_m in range(mid, end, BLOCK_M):
-        k = desc_k.load([start_m, 0])
-        v = desc_v.load([start_m, 0])
-        attn_score = tl.dot(q, tl.permute(k, 1, 0)) 
-        if D2 > 0:
-            k2 = desc_k2.load([start_m, 0])
-            attn_score = tl.dot(q2, tl.permute(k2, 1, 0), attn_score)
-
-        k_idx = (start_m + tl.arange(0, BLOCK_M)) * stride + kernel_size - 1
-        attn_score = tl.where(q_idx[:, None] >= k_idx[None, :], attn_score * sm_scale_ln2, float('-inf'))
-        p = tl.exp2(attn_score - lse[:, None])
 
         dp = tl.dot(do, tl.permute(v, 1, 0))
         ds = p * (dp - delta[:, None])
@@ -527,11 +438,8 @@ def _cmp_dq_kernel(
         if D2 > 0:
             desc_dq2.atomic_add([cp_start_n, 0], (acc_dq2 * sm_scale).to(desc_dq2.dtype))
 
-
 @use_tma
 def cmp_attn_fwd(q, k, v, sm_scale=None, o=None, helper=NSAHelper):
-    if NSAHelper.is_use_ampere_ops():
-        return ampere_ops.cmp_attn_fwd(q, k, v, sm_scale=None, o=None, helper=NSAHelper)
     T, QH, D = q.shape
     T2, KH, D2 = k.shape
     T3, KH2, VD = v.shape
@@ -596,8 +504,7 @@ def cmp_attn_bwd(q, k, v, o, lse, do, dq=None, sm_scale=None, fuse_dqdkdv=False,
     '''
     dkdv_repeat=False is non-deterministic
     '''
-    if NSAHelper.is_use_ampere_ops():
-        return ampere_ops.cmp_attn_bwd(q, k, v, o, lse, do, dq, sm_scale, fuse_dqdkdv, dkdv_dtype, dkdv_repeat, async_dq, helper)
+
     T, QH, D = q.shape
     T2, KH, D2 = k.shape
     T3, KH2, VD = v.shape
